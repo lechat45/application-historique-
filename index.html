@@ -342,6 +342,13 @@ body.compact .stats-row { margin-bottom: 18px; }
 /* --- Badge version "À propos" --- */
 .about__ver { font-family: var(--font); font-size: 12px; font-weight: 800; color: var(--purple); background: rgba(124,92,252,0.14); padding: 2px 9px; border-radius: 999px; margin-left: 7px; vertical-align: middle; }
 
+/* --- Glisser pour supprimer une fiche (historique) --- */
+.swipe { position: relative; border-radius: var(--radius); }
+.swipe__bg { position: absolute; inset: 0; display: flex; align-items: center; gap: 9px; padding-left: 24px; border-radius: var(--radius); background: var(--coral); color: #fff; font-family: var(--display); font-weight: 600; font-size: 16px; }
+.swipe__bg svg { width: 22px; height: 22px; }
+.swipe--armed .swipe__bg { background: var(--coral-d); }
+.swipe .card { position: relative; touch-action: pan-y; will-change: transform; }
+
 </style>
 </head>
 <body>
@@ -661,6 +668,10 @@ const db = {
     const d = await this.open();
     return new Promise((res, rej) => { const tx = d.transaction("scans", "readwrite"); tx.objectStore("scans").clear(); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
   },
+  async delete(id) {
+    const d = await this.open();
+    return new Promise((res, rej) => { const tx = d.transaction("scans", "readwrite"); tx.objectStore("scans").delete(id); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+  },
 };
 
 /* ------------------------------------------------------------------ */
@@ -704,7 +715,9 @@ function frameToBlob(source) {
   const scale = Math.min(1, maxDim / Math.max(w, h));
   const cw = Math.round(w * scale), ch = Math.round(h * scale);
   const c = document.createElement("canvas"); c.width = cw; c.height = ch;
-  c.getContext("2d").drawImage(source, 0, 0, cw, ch);
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, cw, ch);   // fond blanc : évite le "tout noir" sur logos transparents
+  ctx.drawImage(source, 0, 0, cw, ch);
   return new Promise((res) => c.toBlob((b) => res({ blob: b, thumb: c.toDataURL("image/jpeg", 0.5) }), "image/jpeg", quality));
 }
 
@@ -863,16 +876,12 @@ function openFiche(item) {
   }
 
   const actions = el("div", "fiche__actions");
-  const listen = el("button", "action", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10v4h4l5 4V6L7 10H3z"/><path d="M16 8a4 4 0 010 8"/></svg> Écouter`);
-  listen.onclick = () => speak(f);
-  const copy = el("button", "action", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V6a2 2 0 012-2h8"/></svg> Copier`);
-  copy.onclick = () => copyFiche(f);
   const fav = el("button", "action", favIcon(item.fav) + (item.fav ? " Favori" : " Ajouter"));
   fav.onclick = async () => { item.fav = !item.fav; try { await db.put(item); } catch {} fav.innerHTML = favIcon(item.fav) + (item.fav ? " Favori" : " Ajouter"); fav.classList.toggle("action--fav", item.fav); toast(item.fav ? "Ajouté aux favoris ★" : "Retiré des favoris"); };
   fav.classList.toggle("action--fav", item.fav);
   const share = el("button", "action action--primary", `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12v7a1 1 0 001 1h14a1 1 0 001-1v-7"/><path d="M12 3v13M8 7l4-4 4 4"/></svg> Partager`);
   share.onclick = () => shareFiche(f);
-  actions.append(listen, copy, fav, share);
+  actions.append(fav, share);
   body.appendChild(actions);
 
   $("#fiche").hidden = false;
@@ -925,15 +934,60 @@ async function renderHistory() {
   $("#historyEmpty").hidden = items.length > 0;
   items.forEach((it) => {
     const cat = (it.categorie || "autre").toLowerCase();
+    const wrap = el("div", "swipe");
+    wrap.innerHTML = `<div class="swipe__bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2M6 7l1 12a2 2 0 002 2h6a2 2 0 002-2l1-12"/></svg><span>Supprimer</span></div>`;
     const card = el("div", "card");
     card.innerHTML = `<img class="card__thumb" src="${it.thumb || ""}" alt="" /><div class="card__body"><div class="card__title">${esc(it.sujet)}</div><div class="card__meta">${formatDate(it.date)}</div></div><button class="card__fav${it.fav ? " card__fav--on" : ""}" aria-label="Favori">${favIcon(!!it.fav)}</button><span class="card__tag tag--${cat}">${esc(cat)}</span>`;
-    card.onclick = () => openFiche(it);
+    card.addEventListener("click", () => { if (!card._suppressClick) openFiche(it); });
     card.querySelector(".card__fav").onclick = async (e) => {
       e.stopPropagation(); it.fav = !it.fav; try { await db.put(it); } catch {}
       renderHistory();
     };
-    list.appendChild(card);
+    attachSwipeDelete(card, wrap, it);
+    wrap.appendChild(card);
+    list.appendChild(wrap);
   });
+}
+
+/* Glisser une carte vers la DROITE pour la supprimer */
+function attachSwipeDelete(card, wrap, item) {
+  let startX = 0, startY = 0, dx = 0, active = false, decided = false, horizontal = false;
+  const TH = 110; // seuil de suppression (px)
+  card.addEventListener("pointerdown", (e) => {
+    active = true; decided = false; horizontal = false; dx = 0;
+    startX = e.clientX; startY = e.clientY;
+    card.style.transition = "none";
+  });
+  card.addEventListener("pointermove", (e) => {
+    if (!active) return;
+    dx = e.clientX - startX; const dy = e.clientY - startY;
+    if (!decided) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      decided = true; horizontal = Math.abs(dx) > Math.abs(dy);
+      if (horizontal) { try { card.setPointerCapture(e.pointerId); } catch {} }
+      else { active = false; return; }
+    }
+    e.preventDefault();
+    const x = Math.max(0, dx);
+    card.style.transform = `translateX(${x}px)`;
+    wrap.classList.toggle("swipe--armed", x > TH);
+  });
+  const end = async () => {
+    if (!active) return; active = false;
+    card.style.transition = "transform .2s ease";
+    if (decided && horizontal && Math.abs(dx) > 8) { card._suppressClick = true; setTimeout(() => (card._suppressClick = false), 60); }
+    if (horizontal && dx > TH) {
+      card.style.transform = "translateX(110%)";
+      wrap.style.cssText += "transition:.22s ease;overflow:hidden;";
+      setTimeout(() => { wrap.style.height = wrap.offsetHeight + "px"; requestAnimationFrame(() => { wrap.style.height = "0"; wrap.style.opacity = "0"; wrap.style.marginTop = "-13px"; }); }, 200);
+      setTimeout(async () => { try { await db.delete(item.id); } catch {} renderHistory(); renderProfil(); toast("Fiche supprimée"); }, 430);
+    } else {
+      card.style.transform = "translateX(0)";
+      wrap.classList.remove("swipe--armed");
+    }
+  };
+  card.addEventListener("pointerup", end);
+  card.addEventListener("pointercancel", end);
 }
 function formatDate(iso) { try { return new Date(iso).toLocaleDateString("fr-FR", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }); } catch { return ""; } }
 
